@@ -18,9 +18,16 @@ natural parameters, with smooth, finite gradients everywhere (no hard
 
 from __future__ import annotations
 
+import numpy as np
 import jax.numpy as jnp
 import jax.nn as jnn
 from jax.scipy.stats import norm
+
+
+def _gauss_pdf(x, loc, scale):
+    return np.exp(-0.5 * ((x - loc) / scale) ** 2) / (
+        scale * np.sqrt(2 * np.pi)
+    )
 
 
 class Normal:
@@ -41,6 +48,10 @@ class Normal:
 
     def init(self):
         return float(self.loc)
+
+    def pdf(self, x):
+        """Prior density in *natural*-parameter space (for plotting)."""
+        return _gauss_pdf(np.asarray(x, dtype=float), self.loc, self.scale)
 
 
 class LogNormal:
@@ -64,6 +75,13 @@ class LogNormal:
 
     def init(self):
         return float(self.loc)
+
+    def pdf(self, x):
+        """Log-normal density in natural-parameter space (for plotting)."""
+        x = np.asarray(x, dtype=float)
+        safe = np.where(x > 0, x, 1.0)
+        g = _gauss_pdf(np.log(safe), self.loc, self.scale)
+        return np.where(x > 0, g / safe, 0.0)
 
 
 class LogUniform:
@@ -93,3 +111,11 @@ class LogUniform:
 
     def init(self):
         return 0.0  # sigmoid(0) -> midpoint in log-space
+
+    def pdf(self, x):
+        """``p(theta) = 1/(theta * span)`` on ``[low, high]`` (for plotting)."""
+        x = np.asarray(x, dtype=float)
+        low, high = np.exp(self.log_low), np.exp(self.log_high)
+        safe = np.where(x > 0, x, 1.0)
+        val = 1.0 / (safe * self._span)
+        return np.where((x >= low) & (x <= high), val, 0.0)

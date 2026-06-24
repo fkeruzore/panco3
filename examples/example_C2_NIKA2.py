@@ -6,8 +6,8 @@ JAX forward model and BlackJAX NUTS sampling. Run with::
     uv run python examples/example_C2_NIKA2.py
 
 It loads the mock NIKA2 map shipped with panco2, fits a 5-bin pressure profile,
-and saves a profile-recovery figure and a data/model/residual figure to
-``examples/output/``.
+and saves a profile-recovery figure, a data/model/residual figure, and NUTS
+diagnostic figures (trace + corner, truth overlaid) to ``examples/output/``.
 """
 
 import os
@@ -99,6 +99,12 @@ def main():
     print(az.summary(idata)[["mean", "sd", "r_hat", "ess_bulk"]])
 
     # --- 6. Figures -------------------------------------------------------- #
+    # Reference ("truth") values: the A10 profile the mock was built from, with
+    # the calibration `conv` and `zero` level at their nominal values.
+    truth = {f"P_{i}": P for i, P in enumerate(P_a10)}
+    truth["conv"] = -12.0
+    truth["zero"] = 0.0
+
     r = np.logspace(np.log10(r_bins[0]), np.log10(r_bins[-1]), 50)
     ax = results.plot_pressure_profile(ppf.model, cs, r, truth=P_a10)
     ax.set_title("Recovered pressure profile (truth = A10 guess)")
@@ -113,6 +119,20 @@ def main():
         dpi=120,
         bbox_inches="tight",
     )
+
+    # Trace + marginals (truth lines overlaid).
+    tr_axes = results.plot_trace(cs, ppf.model, truth=truth)
+    tr_axes.ravel()[0].figure.savefig(
+        os.path.join(OUT, "trace.png"), dpi=120, bbox_inches="tight"
+    )
+
+    # Corner plot: contours (lower) + point cloud (upper), with truth lines
+    # and prior densities overlaid on the 1-D marginals.
+    co_axes = results.plot_corner(cs, ppf.model, truth=truth, priors=plist)
+    co_axes.ravel()[0].figure.savefig(
+        os.path.join(OUT, "corner.png"), dpi=120, bbox_inches="tight"
+    )
+
     plt.close("all")
     print(f"Saved figures to {OUT}")
 

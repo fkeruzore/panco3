@@ -48,11 +48,21 @@ result, constrain, log_post = inference.fit(
     ppf, num_warmup=500, num_samples=1000, num_chains=4,
 )
 samples = inference.constrained_samples(result, constrain)   # natural-parameter space
-results.plot_pressure_profile(ppf.model, samples, r_bins)
+results.plot_pressure_profile(ppf.model, samples, r_bins, truth=P0)
+results.plot_trace(samples, ppf.model, truth=truth_dict)      # truth lines overlaid
+results.plot_corner(samples, ppf.model, truth=truth_dict, priors=plist)
 ```
 
+`truth` may be a `{param_name: value}` dict or a full par-vec array; pass it to
+`plot_trace`/`plot_corner` to overlay reference values (omit for no overlay).
+`plot_corner` draws filled 1- & 2-sigma contours below the diagonal and the
+posterior point cloud above it; on the 1-D marginals it overlays the truth as a
+vertical line and (if `priors=` is given, e.g. the `prior_list` from
+`make_log_posterior`) the prior density.
+
 See `examples/example_C2_NIKA2.py` for a full runnable example on the mock NIKA2
-map shipped with panco2.
+map shipped with panco2. It writes four figures to `examples/output/`:
+`profile_recovery.png`, `data_model_residual.png`, `trace.png`, and `corner.png`.
 
 ## Key modules (`src/panco3/`)
 

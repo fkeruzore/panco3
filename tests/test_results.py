@@ -69,3 +69,54 @@ def test_plots_run(model_and_samples, tmp_path):
     ax = results.plot_pressure_profile(m, samples, r, truth=P_true)
     ax.figure.savefig(tmp_path / "prof.png")
     plt.close("all")
+
+
+def test_to_inference_data(model_and_samples):
+    m, samples, _ = model_and_samples
+    idata = results.to_inference_data(samples, m)
+    assert set(idata.posterior.data_vars) == set(m.params)
+    # Constrained (physical) space: pressures are positive, not log values.
+    assert float(idata.posterior["P_0"].mean()) > 0
+
+
+def test_trace_and_corner_run(model_and_samples, tmp_path):
+    import matplotlib.pyplot as plt
+    from panco3 import priors
+
+    m, samples, P_true = model_and_samples
+    truth = {f"P_{i}": P for i, P in enumerate(P_true)}
+    truth["conv"] = 1.0
+    truth["zero"] = 0.0
+
+    tr = results.plot_trace(samples, m, truth=truth)
+    tr.ravel()[0].figure.savefig(tmp_path / "trace.png")
+
+    # Corner: lower=contours, upper=cloud, diagonal truth line + prior. Use an
+    # ordered prior list (as returned by make_log_posterior) and truth dict.
+    plist = [priors.LogNormal(np.log(P), 0.4) for P in P_true] + [
+        priors.Normal(1.0, 0.02),
+        priors.Normal(0.0, 1e-5),
+    ]
+    co = results.plot_corner(samples, m, truth=truth, priors=plist)
+    assert co.shape == (m.n_params, m.n_params)
+    co.ravel()[0].figure.savefig(tmp_path / "corner.png")
+
+    # truth as a full par_vec array should also work (no priors).
+    co2 = results.plot_corner(samples, m, truth=results.median_par_vec(samples))
+    co2.ravel()[0].figure.savefig(tmp_path / "corner2.png")
+    plt.close("all")
+
+
+def test_prior_pdf_normalization():
+    from panco3 import priors
+    from scipy.integrate import quad
+
+    # Each prior's natural-space pdf should integrate to ~1.
+    n = priors.Normal(0.5, 0.2)
+    assert abs(quad(n.pdf, -5, 6)[0] - 1.0) < 1e-6
+
+    ln = priors.LogNormal(np.log(1e-2), 0.5)
+    assert abs(quad(ln.pdf, 0, 1.0)[0] - 1.0) < 1e-4
+
+    lu = priors.LogUniform(1e-3, 1e-1)
+    assert abs(quad(lu.pdf, 0, 0.2)[0] - 1.0) < 1e-6
