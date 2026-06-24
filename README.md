@@ -1,10 +1,14 @@
 # panco3
 
-A differentiable, GPU-capable **JAX port of [panco2](./panco2)** for recovering
-galaxy-cluster electron-pressure profiles from thermal Sunyaev–Zeldovich (tSZ)
+A differentiable, GPU-capable **JAX port of [panco2](https://github.com/fkeruzore/panco2)**
+for recovering galaxy-cluster electron-pressure profiles from thermal Sunyaev–Zeldovich (tSZ)
 maps. The forward model is fully autodiff-able, so inference uses **Hamiltonian
 Monte Carlo / NUTS** (via [BlackJAX](https://github.com/blackjax-devs/blackjax))
 instead of panco2's ensemble MCMC.
+
+**Important note:** This is an exercise in agent-assisted coding: most code in
+this repository is generated using Claude Code. For a stable, tested version,
+use [panco2](https://github.com/fkeruzore/panco2).
 
 ## What's different from panco2
 
