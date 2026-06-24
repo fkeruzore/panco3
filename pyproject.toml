@@ -1,0 +1,51 @@
+[project]
+name = "panco3"
+version = "0.1.0"
+description = "panco3: a differentiable (JAX) pressure profile fitter from tSZ observations"
+readme = "README.md"
+authors = [
+    { name = "Florian Kéruzoré", email = "fkeruzore@anl.gov" }
+]
+requires-python = ">=3.11"
+dependencies = [
+    "jax>=0.4.30",
+    "blackjax>=1.2",
+    "jax-cosmo>=0.1",
+    "halox",
+    "astropy>=6.0",
+    "numpy>=1.26",
+    "scipy>=1.11",
+    "arviz>=0.18",
+    "matplotlib>=3.8",
+    "dill>=0.3.8",
+]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.15.19",
+    "pytest>=8.0",
+    "pytest-benchmark>=4.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "slow: end-to-end sampling tests (deselect with '-m \"not slow\"')",
+]
+filterwarnings = [
+    "ignore::DeprecationWarning",
+    "ignore::UserWarning",
+]
+
+[tool.ruff]
+line-length = 79
+
+[tool.ruff.lint]
+select = ["E", "F", "B"]
+
+[tool.ruff.format]
+docstring-code-format = true
