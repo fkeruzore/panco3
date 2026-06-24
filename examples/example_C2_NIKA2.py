@@ -24,9 +24,9 @@ import panco3
 from panco3 import priors, posterior, inference, results
 
 HERE = os.path.dirname(__file__)
-FITS = os.path.join(
-    HERE, "..", "panco2", "examples", "C2_NIKA2", "C2_nk2.fits"
-)
+C2 = os.path.join(HERE, "..", "panco2", "examples", "C2_NIKA2")
+FITS = os.path.join(C2, "C2_nk2.fits")
+TF_FILE = os.path.join(C2, "nk2_tf.npz")
 OUT = os.path.join(HERE, "output")
 os.makedirs(OUT, exist_ok=True)
 
@@ -51,17 +51,26 @@ def main():
     r_bins = np.logspace(np.log10(beam_kpc), np.log10(1.1 * half_kpc), 4)
     ppf.define_model(r_bins, n_nodes=16)
 
-    # --- 3. Beam filtering (18" FWHM NIKA2 beam) --------------------------- #
-    ppf.add_filtering(beam_fwhm=18.0)
+    # --- 3. Beam + transfer-function filtering ----------------------------- #
+    # The mock map was generated WITH the NIKA2 angular transfer function (a
+    # high-pass filter: tf -> 0 at low ell, killing extended signal). Fitting
+    # with the beam ONLY would mis-model the data -- the model would predict
+    # large-scale emission that has been filtered out, and the fit would
+    # suppress the outer pressure bins to compensate, biasing the recovered
+    # profile low (increasingly so outward). So we must apply the same TF.
+    tf = np.load(TF_FILE)
+    ppf.add_filtering(
+        beam_fwhm=18.0, ell=tf["ell"], tf=tf["tf_150GHz"], pad=20
+    )
 
     # --- 4. Priors: log-normal on pressures (A10 guess), normal nuisances -- #
     # NOTE on `conv`: the model is ``conv * filter(y(P))``, so `conv` (the
     # Compton-y -> map-unit conversion) trades multiplicatively against the
-    # overall pressure amplitude -- a curved degeneracy that makes HMC mix
-    # slowly under a broad `conv` prior (panco2's emcee hides this; NUTS
-    # exposes it). `conv` is a calibration factor known to ~%, so a tight
-    # prior is both physical and breaks the degeneracy, giving clean
-    # convergence.
+    # overall pressure amplitude. `conv` is a calibration factor known to ~%,
+    # so a tight prior is physical and also avoids that (mild funnel)
+    # degeneracy. (The priors sample in whitened/standardized coordinates --
+    # see panco3.priors -- which is what makes NUTS mix efficiently here
+    # despite the very different parameter scales and the transfer function.)
     P_a10 = np.asarray(
         panco3.utils.gNFW_from_params(r_bins, ppf.cluster.A10_params)
     )
@@ -99,15 +108,15 @@ def main():
     print(az.summary(idata)[["mean", "sd", "r_hat", "ess_bulk"]])
 
     # --- 6. Figures -------------------------------------------------------- #
-    # Reference ("truth") values: the A10 profile the mock was built from, with
-    # the calibration `conv` and `zero` level at their nominal values.
+    # Truth: the Arnaud+2010 (A10) profile the mock map was generated from,
+    # with the calibration `conv` and `zero` level at their nominal values.
     truth = {f"P_{i}": P for i, P in enumerate(P_a10)}
     truth["conv"] = -12.0
     truth["zero"] = 0.0
 
     r = np.logspace(np.log10(r_bins[0]), np.log10(r_bins[-1]), 50)
     ax = results.plot_pressure_profile(ppf.model, cs, r, truth=P_a10)
-    ax.set_title("Recovered pressure profile (truth = A10 guess)")
+    ax.set_title("Recovered pressure profile (truth = A10)")
     ax.figure.savefig(
         os.path.join(OUT, "profile_recovery.png"), dpi=120, bbox_inches="tight"
     )
