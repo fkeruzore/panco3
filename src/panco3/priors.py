@@ -113,7 +113,8 @@ class LogUniform:
         return 0.0  # sigmoid(0) -> midpoint in log-space
 
     def pdf(self, x):
-        """``p(theta) = 1/(theta * span)`` on ``[low, high]`` (for plotting)."""
+        """``p(theta) = 1/(theta * span)`` on ``[low, high]``
+        (for plotting)."""
         x = np.asarray(x, dtype=float)
         low, high = np.exp(self.log_low), np.exp(self.log_high)
         safe = np.where(x > 0, x, 1.0)

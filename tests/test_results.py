@@ -102,7 +102,9 @@ def test_trace_and_corner_run(model_and_samples, tmp_path):
     co.ravel()[0].figure.savefig(tmp_path / "corner.png")
 
     # truth as a full par_vec array should also work (no priors).
-    co2 = results.plot_corner(samples, m, truth=results.median_par_vec(samples))
+    co2 = results.plot_corner(
+        samples, m, truth=results.median_par_vec(samples)
+    )
     co2.ravel()[0].figure.savefig(tmp_path / "corner2.png")
     plt.close("all")
 

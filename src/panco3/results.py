@@ -105,7 +105,9 @@ def plot_trace(constrained_samples, model, truth=None, var_names=None):
     import arviz as az
 
     idata = to_inference_data(constrained_samples, model, var_names)
-    names = var_names if var_names is not None else list(idata.posterior.data_vars)
+    names = (
+        var_names if var_names is not None else list(idata.posterior.data_vars)
+    )
     td = _truth_dict(truth, model)
     lines = [(n, {}, td[n]) for n in names if n in td] or None
     axes = az.plot_trace(idata, var_names=names, lines=lines, compact=False)
@@ -139,18 +141,23 @@ def _corner_range(x, truth_val=None, pad=0.05):
     return lo - d, hi + d
 
 
-def _credible_levels(H, fracs=(1 - np.exp(-0.5), 1 - np.exp(-2.0))):
+_DEFAULT_FRACS = (1 - np.exp(-0.5), 1 - np.exp(-2.0))
+
+
+def _credible_levels(H, fracs=_DEFAULT_FRACS):
     """Density levels enclosing ``fracs`` of the probability mass.
 
-    Defaults are the 2-D 1- and 2-sigma regions (``1 - exp(-n^2/2)`` =
-    39.3% / 86.5%), the standard ``corner.py`` convention.
+    Defaults are the 2-D 1- and 2-sigma regions (``1 - exp(-n^2/2)``
+    = 39.3% / 86.5%), the standard ``corner.py`` convention.
     """
     flat = np.sort(H.ravel())[::-1]
     csum = np.cumsum(flat)
     if csum[-1] == 0:
         return np.array([0.0])
     csum /= csum[-1]
-    levels = [flat[min(np.searchsorted(csum, f), len(flat) - 1)] for f in fracs]
+    levels = [
+        flat[min(np.searchsorted(csum, f), len(flat) - 1)] for f in fracs
+    ]
     return np.unique(levels)  # ascending: [2-sigma, 1-sigma]
 
 
@@ -250,11 +257,18 @@ def plot_corner(
                 cf = np.concatenate([lv, [H.max() * (1 + 1e-6) + 1e-12]])
                 nb = len(cf) - 1
                 ax.contourf(xc, yc, H.T, levels=cf, colors=fill_colors[-nb:])
-                ax.contour(xc, yc, H.T, levels=lv, colors=color, linewidths=0.9)
+                ax.contour(
+                    xc, yc, H.T, levels=lv, colors=color, linewidths=0.9
+                )
                 if ni in td and nj in td:
                     ax.plot(
-                        td[nj], td[ni], "s", color=truth_color,
-                        ms=5, mec="k", mew=0.5,
+                        td[nj],
+                        td[ni],
+                        "s",
+                        color=truth_color,
+                        ms=5,
+                        mec="k",
+                        mew=0.5,
                     )
                 ax.set_xlim(*rng[nj])
                 ax.set_ylim(*rng[ni])
@@ -262,18 +276,28 @@ def plot_corner(
             else:
                 # --- upper triangle: posterior point cloud ---------------- #
                 ax.scatter(
-                    data[nj], data[ni], s=3, alpha=0.15,
-                    color=color, edgecolors="none", rasterized=True,
+                    data[nj],
+                    data[ni],
+                    s=3,
+                    alpha=0.15,
+                    color=color,
+                    edgecolors="none",
+                    rasterized=True,
                 )
                 if ni in td and nj in td:
                     ax.plot(
-                        td[nj], td[ni], "s", color=truth_color,
-                        ms=5, mec="k", mew=0.5,
+                        td[nj],
+                        td[ni],
+                        "s",
+                        color=truth_color,
+                        ms=5,
+                        mec="k",
+                        mew=0.5,
                     )
                 ax.set_xlim(*rng[nj])
                 ax.set_ylim(*rng[ni])
 
-            # --- ticks / labels: outer edges only --------------------------- #
+            # --- ticks / labels: outer edges only ------------------------ #
             if i == k - 1:
                 ax.set_xlabel(nj)
                 for lab in ax.get_xticklabels():
