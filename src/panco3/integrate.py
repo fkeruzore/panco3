@@ -43,13 +43,17 @@ from .interp import interp_powerlaw
 
 
 @functools.lru_cache(maxsize=8)
-def gauss_legendre(n_nodes: int) -> tuple[Array, Array]:
-    """Gauss-Legendre nodes/weights on ``[-1, 1]`` as float64 jax arrays.
+def gauss_legendre(n_nodes: int) -> tuple[np.ndarray, np.ndarray]:
+    """Gauss-Legendre nodes/weights on ``[-1, 1]`` as float64 numpy arrays.
 
     Cached: the nodes are static constants reused across every evaluation.
+    We return *numpy* (not jax) arrays on purpose: a cached jax array created
+    inside the first ``jit`` trace would leak that trace's context and raise
+    ``UnexpectedTracerError`` on a later, independent ``jit``. NumPy arrays are
+    instead folded in as concrete constants in each trace.
     """
     x, w = np.polynomial.legendre.leggauss(int(n_nodes))
-    return jnp.asarray(x, dtype=jnp.float64), jnp.asarray(w, dtype=jnp.float64)
+    return x.astype(np.float64), w.astype(np.float64)
 
 
 def compton_y_profile(
