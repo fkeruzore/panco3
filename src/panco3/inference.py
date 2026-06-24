@@ -42,6 +42,7 @@ def run_nuts(
     target_acceptance_rate: float = 0.8,
     init_jitter: float = 0.1,
     dense_mass: bool = True,
+    max_num_doublings: int | None = None,
 ):
     """Sample ``log_posterior`` with windowed-warmup NUTS.
 
@@ -53,7 +54,17 @@ def run_nuts(
     important when parameters are correlated (e.g. the conversion factor vs
     the overall pressure amplitude in tSZ fits) -- a diagonal mass matrix
     mixes such ridges very slowly.
+
+    ``max_num_doublings`` caps the NUTS tree depth (max ``2**k`` leapfrog
+    steps per sample). Leave ``None`` for BlackJAX's default (10 -> 1024).
+    A realistic instrument transfer function makes the pressure posterior
+    stiff/ill-conditioned (well-constrained small scales, weakly-constrained
+    large scales), so NUTS otherwise pegs at the maximum trajectory length;
+    a cap bounds the per-sample cost at the price of some mixing efficiency.
     """
+    extra = {}
+    if max_num_doublings is not None:
+        extra["max_num_doublings"] = max_num_doublings
     if rng_key is None:
         rng_key = jax.random.PRNGKey(0)
     init_z = jnp.asarray(init_z)
@@ -73,10 +84,13 @@ def run_nuts(
             log_posterior,
             is_mass_matrix_diagonal=not dense_mass,
             target_acceptance_rate=target_acceptance_rate,
+            **extra,
         )
         (last_state, parameters), _ = warmup.run(
             wkey, z_start, num_steps=num_warmup
         )
+        # ``parameters`` from warmup already carries ``max_num_doublings``
+        # (forwarded via ``extra`` above), so don't pass it again here.
         kernel = blackjax.nuts(log_posterior, **parameters)
         states, infos = _inference_loop(skey, kernel, last_state, num_samples)
         return states.position, infos.acceptance_rate, infos.is_divergent

@@ -14,6 +14,18 @@ prior here exposes:
 This lets the sampler run on an unconstrained vector while the model sees
 natural parameters, with smooth, finite gradients everywhere (no hard
 ``-inf`` walls).
+
+**Whitened (standardized) coordinates.** ``Normal``/``LogNormal`` sample a
+*standardized* ``z ~ N(0, 1)`` and put the location/scale inside
+``constrain`` (``theta = loc + scale * z`` resp. ``exp(loc + scale * z)``).
+This is a pure reparametrization -- the pushforward prior on ``theta`` is
+unchanged -- but it makes every sampling coordinate O(1) regardless of the
+prior scale. Without it, mixing scales like ``conv`` (sigma ~ 0.05) and
+``zero`` (sigma ~ 1e-4) with pressures gives unconstrained coordinates that
+differ by 4+ orders of magnitude; NUTS warmup then cannot bootstrap a usable
+mass matrix and the sampler pegs at the maximum tree depth. Whitening removes
+that disparity and is essential for efficient HMC on the (stiff) tSZ
+posterior, especially with a realistic instrument transfer function.
 """
 
 from __future__ import annotations
@@ -31,9 +43,10 @@ def _gauss_pdf(x, loc, scale):
 
 
 class Normal:
-    """Gaussian prior on a real parameter (identity coordinate).
+    """Gaussian prior on a real parameter, sampled in *standardized* units.
 
-    Suitable for ``conv``, ``zero``, and point-source fluxes.
+    Sampling coordinate ``z ~ N(0, 1)``; ``theta = loc + scale * z``. Suitable
+    for ``conv``, ``zero``, and point-source fluxes.
     """
 
     def __init__(self, loc: float, scale: float):
@@ -41,13 +54,13 @@ class Normal:
         self.scale = scale
 
     def constrain(self, z):
-        return z
+        return self.loc + self.scale * z
 
     def log_prob(self, z):
-        return norm.logpdf(z, self.loc, self.scale)
+        return norm.logpdf(z, 0.0, 1.0)
 
     def init(self):
-        return float(self.loc)
+        return 0.0  # constrain(0) -> loc
 
     def pdf(self, x):
         """Prior density in *natural*-parameter space (for plotting)."""
@@ -55,12 +68,13 @@ class Normal:
 
 
 class LogNormal:
-    """Log-normal prior on a positive parameter; sample ``z = log(theta)``.
+    """Log-normal prior on a positive parameter, sampled in standardized units.
 
-    The prior is ``Normal(loc, scale)`` on ``log(theta)`` and we sample in
-    that coordinate, so no extra Jacobian is needed. Ideal for pressure bins
-    under HMC (unbounded, smooth). ``loc``/``scale`` are in natural log
-    units.
+    The prior is ``Normal(loc, scale)`` on ``log(theta)``. We sample a
+    standardized ``z ~ N(0, 1)`` and set ``theta = exp(loc + scale * z)``, so
+    the pushforward on ``theta`` is exactly that log-normal but every sampling
+    coordinate is O(1) (see module docstring). Ideal for pressure bins under
+    HMC (unbounded, smooth). ``loc``/``scale`` are in natural log units.
     """
 
     def __init__(self, loc: float, scale: float):
@@ -68,13 +82,13 @@ class LogNormal:
         self.scale = scale
 
     def constrain(self, z):
-        return jnp.exp(z)
+        return jnp.exp(self.loc + self.scale * z)
 
     def log_prob(self, z):
-        return norm.logpdf(z, self.loc, self.scale)
+        return norm.logpdf(z, 0.0, 1.0)
 
     def init(self):
-        return float(self.loc)
+        return 0.0  # constrain(0) -> exp(loc)
 
     def pdf(self, x):
         """Log-normal density in natural-parameter space (for plotting)."""
