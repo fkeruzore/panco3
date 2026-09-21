@@ -57,7 +57,7 @@ def plot_pressure_profile(model, constrained_samples, r, truth=None, ax=None):
     ax.plot(r, mid, label="median")
     if truth is not None:
         ax.plot(
-            np.asarray(model.r_bins), np.asarray(truth), "ko", label="truth"
+            np.asarray(model.r_bins), np.asarray(truth), "k--", label="truth"
         )
     ax.set(
         xscale="log",

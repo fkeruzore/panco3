@@ -19,6 +19,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import jax
 from astropy.coordinates import SkyCoord
+import time
 
 import panco3
 from panco3 import priors, posterior, inference, results
@@ -40,7 +41,7 @@ def main():
         z=0.5,
         M_500=6e14,
         coords_center=SkyCoord("12h00m00s +00d00m00s"),
-        map_size=3.0,
+        map_size=6.5,
     )
 
     # --- 2. Radial binning (beam scale -> ~1.1 x half-map) ----------------- #
@@ -48,7 +49,7 @@ def main():
     # unconstrained by the data, become prior-dominated, and stall HMC mixing.
     beam_kpc = ppf.cluster.arcsec2kpc(18.0)
     half_kpc = ppf.cluster.arcsec2kpc(ppf.map_size * 60 / 2)
-    r_bins = np.logspace(np.log10(beam_kpc), np.log10(1.1 * half_kpc), 4)
+    r_bins = np.logspace(np.log10(beam_kpc), np.log10(1.1 * half_kpc), 7)
     ppf.define_model(r_bins, n_nodes=16)
 
     # --- 3. Beam + transfer-function filtering ----------------------------- #
@@ -84,15 +85,18 @@ def main():
     log_post, plist, init_z, constrain = posterior.make_log_posterior(ppf)
     print(f"log-posterior at init: {float(log_post(init_z)):.1f}", flush=True)
     print("running NUTS (dense mass matrix) ...", flush=True)
+    ti = time.time()
     result = inference.run_nuts(
         log_post,
         init_z,
-        num_warmup=500,
-        num_samples=500,
-        num_chains=2,
+        num_warmup=400,
+        num_samples=800,
+        num_chains=4,
         dense_mass=True,
         rng_key=jax.random.PRNGKey(0),
     )
+    dt = time.time() - ti
+    print(f"running time: {dt:.1f} s")
     print(
         f"mean acceptance: {result['acceptance_rate'].mean():.2f}, "
         f"divergences: {int(result['divergences'].sum())}",
