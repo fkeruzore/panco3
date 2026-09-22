@@ -38,6 +38,7 @@ from dataclasses import asdict, dataclass
 from typing import Any
 
 import numpy as np
+from tqdm import tqdm
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -156,7 +157,6 @@ def settings_from_args(args: argparse.Namespace) -> Settings:
     )
 
 
-
 def radial_bins(fitter: Any, n_bins: int) -> np.ndarray:
     """The C2/NIKA2 binning used by panco2 validation."""
     pix_kpc = fitter.cluster.arcsec2kpc(fitter.pix_size)
@@ -202,6 +202,14 @@ def diagnostics(draws: np.ndarray, settings: Settings) -> dict[str, Any]:
         "max_rhat": max_rhat,
         "min_ess": min_ess,
     }
+
+
+def show_diagnostics(bar: tqdm, checked: dict[str, Any]) -> None:
+    """Display the latest convergence diagnostics on a progress bar."""
+    if checked["max_rhat"] is not None:
+        bar.set_postfix(
+            rhat=f"{checked['max_rhat']:.3f}", ess=f"{checked['min_ess']:.0f}"
+        )
 
 
 def measure_panco2_posterior(
@@ -278,6 +286,7 @@ def run_panco2(settings: Settings) -> dict[str, Any]:
         "max_rhat": None,
         "min_ess": None,
     }
+    bar = tqdm(total=settings.max_steps, desc="panco2 sampling", unit="step")
     with Pool(processes=settings.workers) as pool:
         sampler = emcee.EnsembleSampler(
             settings.n_samplers,
@@ -290,14 +299,16 @@ def run_panco2(settings: Settings) -> dict[str, Any]:
         for _completed in range(
             settings.check_every, settings.max_steps + 1, settings.check_every
         ):
-            state = sampler.run_mcmc(
-                state, settings.check_every, progress=False
-            )
+            for step in sampler.sample(state, iterations=settings.check_every):
+                state = step
+                bar.update(1)
             # emcee stores draws as (draw, walker, parameter).
             draws = np.swapaxes(sampler.get_chain(), 0, 1)
             checked = diagnostics(draws, settings)
+            show_diagnostics(bar, checked)
             if checked["converged"]:
                 break
+    bar.close()
     elapsed = time.perf_counter() - started
     draws = np.swapaxes(sampler.get_chain(), 0, 1)
     return {
@@ -413,16 +424,19 @@ def run_panco3(settings: Settings, expected_device: str) -> dict[str, Any]:
         last_state = jax.tree.map(lambda leaf: leaf[-1], trajectory)
         return last_state, trajectory.position, infos
 
+    # jit once so equal-sized chain batches reuse one compiled program.
+    run_warmup = jax.jit(jax.vmap(warm_one))
     run_chunk = jax.jit(jax.vmap(draw_chunk))
+    constrain_draws = jax.jit(jax.vmap(jax.vmap(constrain)))
     started = time.perf_counter()
     state_batches = []
     parameter_batches = []
     z_batches = []
-    for first in range(0, settings.n_samplers, settings.chain_batch_size):
+    firsts = range(0, settings.n_samplers, settings.chain_batch_size)
+    for first in tqdm(firsts, desc="panco3 warmup", unit="batch"):
         last = min(first + settings.chain_batch_size, settings.n_samplers)
-        states, parameters = jax.vmap(warm_one)(
-            chain_keys[first:last], z0[first:last]
-        )
+        states, parameters = run_warmup(chain_keys[first:last], z0[first:last])
+        jax.block_until_ready(states)
         state_batches.append(states)
         parameter_batches.append(parameters)
         z_batches.append((first, last))
@@ -434,6 +448,13 @@ def run_panco3(settings: Settings, expected_device: str) -> dict[str, Any]:
         "max_rhat": None,
         "min_ess": None,
     }
+    # One unit is one draw for one chain batch, so the bar moves after every
+    # batch rather than only once all batches have finished a chunk.
+    bar = tqdm(
+        total=settings.max_steps * len(z_batches),
+        desc="panco3 sampling",
+        unit="draw",
+    )
     for _completed in range(
         settings.check_every, settings.max_steps + 1, settings.check_every
     ):
@@ -447,14 +468,15 @@ def run_panco3(settings: Settings, expected_device: str) -> dict[str, Any]:
                 parameter_batches[batch],
             )
             state_batches[batch] = states
-            draw_batches.append(
-                np.asarray(jax.vmap(jax.vmap(constrain))(positions))
-            )
+            draw_batches.append(np.asarray(constrain_draws(positions)))
+            bar.update(settings.check_every)
         draws.append(np.concatenate(draw_batches, axis=0))
         samples = np.concatenate(draws, axis=1)
         checked = diagnostics(samples, settings)
+        show_diagnostics(bar, checked)
         if checked["converged"]:
             break
+    bar.close()
     jax.block_until_ready(infos.acceptance_rate)
     elapsed = time.perf_counter() - started
     samples = np.concatenate(draws, axis=1)
@@ -504,14 +526,19 @@ def run_worker(
         "--result-json",
         str(result_path),
     ]
+    # stderr is inherited so worker progress bars and tracebacks stay visible.
     completed = subprocess.run(
-        command, cwd=ROOT, env=env, text=True, capture_output=True
+        command, cwd=ROOT, env=env, text=True, stdout=subprocess.PIPE
     )
     if completed.returncode:
         return {
             "implementation": case,
             "unavailable": True,
-            "error": (completed.stderr or completed.stdout).strip(),
+            "error": (
+                completed.stdout.strip()
+                or f"worker exited with code {completed.returncode}; "
+                "see stderr above"
+            ),
         }
     return json.loads(result_path.read_text())
 
