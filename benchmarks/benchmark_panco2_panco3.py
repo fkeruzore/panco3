@@ -8,9 +8,11 @@ the same number of concurrent samplers.
 
 The samplers are different (emcee StretchMove versus BlackJAX NUTS), so a
 "step" means one proposed draw *per sampler*: one emcee walker iteration or
-one post-warmup NUTS draw.  Both runs stop at the same ArviZ diagnostics:
-maximum rank-normalized split R-hat and minimum bulk/tail ESS.  NUTS warmup
-is counted in the panco3 step total and in time to convergence.
+one NUTS draw.  Every column runs the same fixed number of warmup steps
+(discarded emcee burn-in, or BlackJAX window adaptation) followed by the same
+number of sampling steps.  The report gives the total and sampling wall times
+and, computed on the sampling draws only, the rank-normalized split R-hat,
+the integrated autocorrelation time, and the bulk/tail ESS.
 
 Run from the repository root after installing the benchmark dependency::
 
@@ -57,13 +59,10 @@ class Settings:
     n_nodes: int
     n_samplers: int
     workers: int
-    chain_batch_size: int
     gpu_chain_batch_size: int
     warmup: int
-    check_every: int
-    max_steps: int
-    min_ess: int
-    max_rhat: float
+    steps: int
+    chunk_size: int
     posterior_repeats: int
     throughput_batch: int
     seed: int
@@ -97,16 +96,9 @@ def parser() -> argparse.ArgumentParser:
         "--workers",
         type=int,
         default=min(8, os.cpu_count() or 1),
-        help="panco2 CPU worker processes (default: min(8, CPU count)).",
-    )
-    p.add_argument(
-        "--chain-batch-size",
-        type=int,
-        default=None,
         help=(
-            "panco3 CPU chains evaluated concurrently; defaults to "
-            "--workers. All chains still contribute to convergence "
-            "diagnostics."
+            "panco2 CPU worker processes, and panco3 CPU devices (chains "
+            "are split evenly across them); default: min(8, CPU count)."
         ),
     )
     p.add_argument(
@@ -115,11 +107,27 @@ def parser() -> argparse.ArgumentParser:
         default=None,
         help="panco3 GPU chains evaluated concurrently; defaults to all.",
     )
-    p.add_argument("--warmup", type=int, default=500)
-    p.add_argument("--check-every", type=int, default=250)
-    p.add_argument("--max-steps", type=int, default=10000)
-    p.add_argument("--min-ess", type=int, default=400)
-    p.add_argument("--max-rhat", type=float, default=1.01)
+    p.add_argument(
+        "--warmup",
+        type=int,
+        default=500,
+        help="Warmup steps per sampler (emcee burn-in / NUTS adaptation).",
+    )
+    p.add_argument(
+        "--steps",
+        type=int,
+        default=5000,
+        help="Sampling steps per sampler, after warmup.",
+    )
+    p.add_argument(
+        "--chunk-size",
+        type=int,
+        default=None,
+        help=(
+            "panco3 draws per compiled call, i.e. the progress-bar "
+            "granularity; must divide --steps (default: min(100, --steps))."
+        ),
+    )
     p.add_argument("--posterior-repeats", type=int, default=20)
     p.add_argument(
         "--throughput-batch",
@@ -151,15 +159,24 @@ def settings_from_args(args: argparse.Namespace) -> Settings:
             "--n-samplers must be at least twice the parameter count "
             f"({2 * (args.n_bins + 2)}) for emcee."
         )
-    if args.check_every < 4:
-        raise ValueError("--check-every must be at least 4.")
-    chain_batch_size = args.chain_batch_size or args.workers
+    if args.warmup < 1 or args.steps < 4:
+        raise ValueError("--warmup must be >= 1 and --steps >= 4.")
+    chunk_size = args.chunk_size or min(100, args.steps)
+    if chunk_size < 1 or args.steps % chunk_size:
+        raise ValueError("--chunk-size must be positive and divide --steps.")
     gpu_chain_batch_size = args.gpu_chain_batch_size or args.n_samplers
     throughput_batch = args.throughput_batch or args.n_samplers
-    if min(chain_batch_size, gpu_chain_batch_size, throughput_batch) < 1:
+    if min(args.workers, gpu_chain_batch_size, throughput_batch) < 1:
         raise ValueError(
-            "--chain-batch-size, --gpu-chain-batch-size and "
-            "--throughput-batch must be positive."
+            "--workers, --gpu-chain-batch-size and --throughput-batch must "
+            "be positive."
+        )
+    # panco3 CPU splits chains and throughput points evenly over one XLA
+    # device per worker.
+    if args.n_samplers % args.workers or throughput_batch % args.workers:
+        raise ValueError(
+            "--n-samplers and --throughput-batch must be multiples of "
+            "--workers."
         )
     return Settings(
         map_file=str(args.map_file.resolve()),
@@ -169,13 +186,10 @@ def settings_from_args(args: argparse.Namespace) -> Settings:
         n_nodes=args.n_nodes,
         n_samplers=args.n_samplers,
         workers=args.workers,
-        chain_batch_size=chain_batch_size,
         gpu_chain_batch_size=gpu_chain_batch_size,
         warmup=args.warmup,
-        check_every=args.check_every,
-        max_steps=args.max_steps,
-        min_ess=args.min_ess,
-        max_rhat=args.max_rhat,
+        steps=args.steps,
+        chunk_size=chunk_size,
         posterior_repeats=args.posterior_repeats,
         throughput_batch=throughput_batch,
         seed=args.seed,
@@ -197,44 +211,31 @@ def radial_bins(fitter: Any, n_bins: int) -> np.ndarray:
     )
 
 
-def diagnostics(draws: np.ndarray, settings: Settings) -> dict[str, Any]:
-    """Return the common convergence diagnostic for (chain, draw, param)."""
+def diagnostics(draws: np.ndarray) -> dict[str, Any]:
+    """Convergence metrics of post-warmup draws, shaped (chain, draw, param).
+
+    R-hat and ESS are ArviZ's rank-normalized estimators.  The integrated
+    autocorrelation time is emcee's estimator (autocorrelation averaged over
+    chains), in steps; it is only trusted when the chain is at least 50 times
+    longer than the estimate.
+    """
     import arviz as az
+    from emcee.autocorr import integrated_time
 
-    if draws.shape[1] < 4:
-        return {"converged": False, "max_rhat": None, "min_ess": None}
-    rhat = np.asarray(
-        [
-            az.rhat(draws[..., i], method="rank")
-            for i in range(draws.shape[-1])
-        ],
-        dtype=float,
-    )
-    ess_bulk = np.asarray(
-        [az.ess(draws[..., i], method="bulk") for i in range(draws.shape[-1])],
-        dtype=float,
-    )
-    ess_tail = np.asarray(
-        [az.ess(draws[..., i], method="tail") for i in range(draws.shape[-1])],
-        dtype=float,
-    )
-    max_rhat = float(np.nanmax(rhat))
-    min_ess = float(np.nanmin(np.minimum(ess_bulk, ess_tail)))
+    n_params = draws.shape[-1]
+    rhat = [az.rhat(draws[..., i], method="rank") for i in range(n_params)]
+    ess_bulk = [az.ess(draws[..., i], method="bulk") for i in range(n_params)]
+    ess_tail = [az.ess(draws[..., i], method="tail") for i in range(n_params)]
+    # emcee expects (step, walker, param); quiet=True warns instead of
+    # raising when the chain is too short for a reliable estimate.
+    tau = integrated_time(np.swapaxes(draws, 0, 1), quiet=True)
+    max_tau = float(np.nanmax(tau))
     return {
-        "converged": bool(
-            max_rhat <= settings.max_rhat and min_ess >= settings.min_ess
-        ),
-        "max_rhat": max_rhat,
-        "min_ess": min_ess,
+        "max_rhat": float(np.nanmax(rhat)),
+        "max_autocorr_time": max_tau,
+        "autocorr_reliable": bool(draws.shape[1] >= 50 * max_tau),
+        "min_ess": float(np.nanmin(np.minimum(ess_bulk, ess_tail))),
     }
-
-
-def show_diagnostics(bar: tqdm, checked: dict[str, Any]) -> None:
-    """Display the latest convergence diagnostics on a progress bar."""
-    if checked["max_rhat"] is not None:
-        bar.set_postfix(
-            rhat=f"{checked['max_rhat']:.3f}", ess=f"{checked['min_ess']:.0f}"
-        )
 
 
 def natural_starts(
@@ -304,7 +305,7 @@ def measure_panco2_throughput(
 
 
 def run_panco2(settings: Settings) -> dict[str, Any]:
-    """Run emcee in batches, using the shared ArviZ stopping criterion."""
+    """Run a fixed emcee burn-in, then a fixed number of steps."""
     import emcee
     import panco2 as p2
     import scipy.stats as ss
@@ -355,13 +356,9 @@ def run_panco2(settings: Settings) -> dict[str, Any]:
     # Import here to avoid creating worker processes while setup is timed.
     from multiprocessing import Pool
 
+    # Total time includes worker start-up, the parallel counterpart of JAX
+    # compilation for panco3.
     started = time.perf_counter()
-    checked: dict[str, Any] = {
-        "converged": False,
-        "max_rhat": None,
-        "min_ess": None,
-    }
-    bar = tqdm(total=settings.max_steps, desc="panco2 sampling", unit="step")
     with Pool(processes=settings.workers) as pool:
         sampler = emcee.EnsembleSampler(
             settings.n_samplers,
@@ -371,37 +368,36 @@ def run_panco2(settings: Settings) -> dict[str, Any]:
             args=[ppf._log_lhood, ppf.model.log_prior],
         )
         state = starts
-        for _completed in range(
-            settings.check_every, settings.max_steps + 1, settings.check_every
-        ):
-            for step in sampler.sample(state, iterations=settings.check_every):
-                state = step
-                bar.update(1)
-            # emcee stores draws as (draw, walker, parameter).
-            draws = np.swapaxes(sampler.get_chain(), 0, 1)
-            checked = diagnostics(draws, settings)
-            show_diagnostics(bar, checked)
-            if checked["converged"]:
-                break
-    bar.close()
-    elapsed = time.perf_counter() - started
-    draws = np.swapaxes(sampler.get_chain(), 0, 1)
+        bar = tqdm(total=settings.warmup, desc="panco2 warmup", unit="step")
+        for step in sampler.sample(state, iterations=settings.warmup):
+            state = step
+            bar.update(1)
+        bar.close()
+        sampling_started = time.perf_counter()
+        bar = tqdm(total=settings.steps, desc="panco2 sampling", unit="step")
+        for step in sampler.sample(state, iterations=settings.steps):
+            state = step
+            bar.update(1)
+        bar.close()
+        finished = time.perf_counter()
+    # emcee stores draws as (draw, walker, parameter); burn-in is discarded.
+    draws = np.swapaxes(sampler.get_chain(discard=settings.warmup), 0, 1)
     return {
         "implementation": "panco2 (CPU-only)",
         "device": "cpu",
-        "converged": checked["converged"],
-        "steps_per_sampler": int(draws.shape[1]),
+        "warmup_steps": settings.warmup,
+        "sampling_steps": int(draws.shape[1]),
         "posterior_seconds": posterior_seconds,
         "posterior_per_second": posterior_per_second,
-        "time_to_convergence_seconds": elapsed,
-        "max_rhat": checked["max_rhat"],
-        "min_ess": checked["min_ess"],
+        "total_seconds": finished - started,
+        "sampling_seconds": finished - sampling_started,
         "n_samplers": settings.n_samplers,
+        **diagnostics(draws),
     }
 
 
 def run_panco3(settings: Settings, expected_device: str) -> dict[str, Any]:
-    """Run adapted NUTS in chunks, checking common convergence each chunk."""
+    """Run NUTS window adaptation, then a fixed number of draws."""
     import blackjax
     import jax
     import jax.numpy as jnp
@@ -463,10 +459,37 @@ def run_panco3(settings: Settings, expected_device: str) -> dict[str, Any]:
         settings.posterior_repeats * settings.n_samplers
     )
 
+    # Chains are laid out as (device, chain on device): pmap runs each
+    # device's share independently, vmap batches within a device.  The CPU
+    # worker has one XLA device per panco2 worker; the GPU column uses one
+    # GPU.
+    devices = jax.local_devices()
+    if expected_device == "gpu":
+        devices = devices[:1]
+    n_devices = len(devices)
+    batch_size = (
+        settings.gpu_chain_batch_size
+        if expected_device == "gpu"
+        else settings.n_samplers
+    )
+    if batch_size % n_devices or settings.throughput_batch % n_devices:
+        raise RuntimeError(
+            f"chain batches and throughput points must split evenly over "
+            f"{n_devices} devices"
+        )
+
+    def per_device(x: Any) -> Any:
+        return x.reshape(n_devices, x.shape[0] // n_devices, *x.shape[1:])
+
+    def parallel(fn: Any) -> Any:
+        return jax.pmap(jax.vmap(fn), devices=devices)
+
     # Batched throughput is the GPU-relevant figure: one vmapped call over
     # many points amortizes kernel launches that dominate a scalar call.
-    z_batch = jnp.asarray(
-        natural_to_z(throughput_points(pressure, settings), pressure)
+    z_batch = per_device(
+        jnp.asarray(
+            natural_to_z(throughput_points(pressure, settings), pressure)
+        )
     )
 
     def per_second(batched: Any) -> float:
@@ -477,16 +500,11 @@ def run_panco3(settings: Settings, expected_device: str) -> dict[str, Any]:
         elapsed = time.perf_counter() - start
         return settings.posterior_repeats * settings.throughput_batch / elapsed
 
-    posterior_per_second = per_second(jax.jit(jax.vmap(log_posterior)))
+    posterior_per_second = per_second(parallel(log_posterior))
     gradient_per_second = per_second(
-        jax.jit(jax.vmap(jax.value_and_grad(log_posterior)))
+        parallel(jax.value_and_grad(log_posterior))
     )
 
-    batch_size = (
-        settings.gpu_chain_batch_size
-        if expected_device == "gpu"
-        else settings.chain_batch_size
-    )
     warmup_key, sample_key = jax.random.split(
         jax.random.PRNGKey(settings.seed)
     )
@@ -504,15 +522,19 @@ def run_panco3(settings: Settings, expected_device: str) -> dict[str, Any]:
     def draw_chunk(key, state, parameters):
         kernel = blackjax.nuts(log_posterior, **parameters)
         trajectory, infos = inference._inference_loop(
-            key, kernel, state, settings.check_every
+            key, kernel, state, settings.chunk_size
         )
         last_state = jax.tree.map(lambda leaf: leaf[-1], trajectory)
-        return last_state, trajectory.position, infos
+        return (
+            last_state,
+            trajectory.position,
+            infos.num_integration_steps,
+            infos.is_divergent,
+        )
 
-    # jit once so equal-sized chain batches reuse one compiled program.
-    run_warmup = jax.jit(jax.vmap(warm_one))
-    run_chunk = jax.jit(jax.vmap(draw_chunk))
-    constrain_draws = jax.jit(jax.vmap(jax.vmap(constrain)))
+    # Built once so equal-sized chain batches reuse one compiled program.
+    run_warmup = parallel(warm_one)
+    run_chunk = parallel(draw_chunk)
     started = time.perf_counter()
     state_batches = []
     parameter_batches = []
@@ -520,64 +542,84 @@ def run_panco3(settings: Settings, expected_device: str) -> dict[str, Any]:
     firsts = range(0, settings.n_samplers, batch_size)
     for first in tqdm(firsts, desc="panco3 warmup", unit="batch"):
         last = min(first + batch_size, settings.n_samplers)
-        states, parameters = run_warmup(chain_keys[first:last], z0[first:last])
+        states, parameters = run_warmup(
+            per_device(chain_keys[first:last]), per_device(z0[first:last])
+        )
         jax.block_until_ready(states)
         state_batches.append(states)
         parameter_batches.append(parameters)
         z_batches.append((first, last))
-    # The first block both compiles and executes NUTS; compilation is included
-    # in time-to-convergence because it is paid by a real end-to-end run.
-    draws: list[np.ndarray] = []
-    checked: dict[str, Any] = {
-        "converged": False,
-        "max_rhat": None,
-        "min_ess": None,
-    }
+
+    # Compile the sampling kernel ahead of time (once per distinct batch
+    # size), so that compilation counts in the total but not the sampling
+    # time.
+    compiled: dict[int, Any] = {}
+    for batch, (first, last) in enumerate(z_batches):
+        if last - first not in compiled:
+            compiled[last - first] = run_chunk.lower(
+                per_device(chain_keys[first:last]),
+                state_batches[batch],
+                parameter_batches[batch],
+            ).compile()
+
+    positions: list[list[np.ndarray]] = [[] for _ in z_batches]
+    leapfrogs: list[np.ndarray] = []
+    divergent: list[np.ndarray] = []
+    sampling_started = time.perf_counter()
     # One unit is one draw for one chain batch, so the bar moves after every
     # batch rather than only once all batches have finished a chunk.
     bar = tqdm(
-        total=settings.max_steps * len(z_batches),
+        total=settings.steps * len(z_batches),
         desc="panco3 sampling",
         unit="draw",
     )
-    for _completed in range(
-        settings.check_every, settings.max_steps + 1, settings.check_every
-    ):
+    for _chunk in range(settings.steps // settings.chunk_size):
         sample_key, chunk_key = jax.random.split(sample_key)
         keys = jax.random.split(chunk_key, settings.n_samplers)
-        draw_batches = []
         for batch, (first, last) in enumerate(z_batches):
-            states, positions, infos = run_chunk(
-                keys[first:last],
+            states, chunk_positions, n_steps, is_divergent = compiled[
+                last - first
+            ](
+                per_device(keys[first:last]),
                 state_batches[batch],
                 parameter_batches[batch],
             )
             state_batches[batch] = states
-            draw_batches.append(np.asarray(constrain_draws(positions)))
-            bar.update(settings.check_every)
-        draws.append(np.concatenate(draw_batches, axis=0))
-        samples = np.concatenate(draws, axis=1)
-        checked = diagnostics(samples, settings)
-        show_diagnostics(bar, checked)
-        if checked["converged"]:
-            break
+            # Copying to the host also waits for the chunk to finish.
+            chunk_positions = np.asarray(chunk_positions)
+            positions[batch].append(
+                chunk_positions.reshape(-1, *chunk_positions.shape[2:])
+            )
+            leapfrogs.append(np.asarray(n_steps).ravel())
+            divergent.append(np.asarray(is_divergent).ravel())
+            bar.update(settings.chunk_size)
     bar.close()
-    jax.block_until_ready(infos.acceptance_rate)
-    elapsed = time.perf_counter() - started
-    samples = np.concatenate(draws, axis=1)
+    finished = time.perf_counter()
+
+    # (chain, draw, param) in natural space, mapped after timing stops.
+    z_draws = np.concatenate(
+        [np.concatenate(chunks, axis=1) for chunks in positions], axis=0
+    )
+    draws = np.asarray(jax.jit(jax.vmap(jax.vmap(constrain)))(z_draws))
+    leapfrogs_all = np.concatenate(leapfrogs)
+    divergent_all = np.concatenate(divergent)
     return {
         "implementation": f"panco3 ({device})",
         "device": device,
-        "converged": checked["converged"],
-        "steps_per_sampler": settings.warmup + int(samples.shape[1]),
+        "n_devices": n_devices,
+        "warmup_steps": settings.warmup,
+        "sampling_steps": int(draws.shape[1]),
         "posterior_seconds": posterior_seconds,
         "posterior_per_second": posterior_per_second,
         "gradient_per_second": gradient_per_second,
-        "time_to_convergence_seconds": elapsed,
-        "max_rhat": checked["max_rhat"],
-        "min_ess": checked["min_ess"],
+        "total_seconds": finished - started,
+        "sampling_seconds": finished - sampling_started,
         "n_samplers": settings.n_samplers,
         "chain_batch_size": batch_size,
+        "mean_leapfrog_steps": float(leapfrogs_all.mean()),
+        "max_leapfrog_steps": int(leapfrogs_all.max()),
+        "divergent_fraction": float(divergent_all.mean()),
+        **diagnostics(draws),
     }
 
 
@@ -589,15 +631,25 @@ def worker(args: argparse.Namespace) -> None:
         result = run_panco3(settings, "cpu")
     else:
         result = run_panco3(settings, "gpu")
+    result["ess_per_second"] = result["min_ess"] / result["sampling_seconds"]
     args.result_json.write_text(json.dumps(result, indent=2, sort_keys=True))
 
 
 def run_worker(
-    case: str, settings_path: Path, result_path: Path, gpu_platform: str | None
+    case: str,
+    settings: Settings,
+    settings_path: Path,
+    result_path: Path,
+    gpu_platform: str | None,
 ) -> dict[str, Any]:
     env = os.environ.copy()
     if case == "panco3-cpu":
         env["JAX_PLATFORMS"] = "cpu"
+        # One XLA CPU device per worker: a single device runs its program
+        # mostly on one thread, so this is panco3's counterpart to panco2's
+        # process pool.
+        devices = f"--xla_force_host_platform_device_count={settings.workers}"
+        env["XLA_FLAGS"] = f"{env.get('XLA_FLAGS', '')} {devices}".strip()
     elif case == "panco3-gpu":
         # Leaving this unset lets JAX select the installed accelerator backend.
         env.pop("JAX_PLATFORMS", None)
@@ -630,39 +682,42 @@ def run_worker(
     return json.loads(result_path.read_text())
 
 
-def value(
-    result: dict[str, Any], key: str, unit: str = "", per_run: bool = False
-) -> str:
-    """Format one table cell; ``per_run`` marks convergence-run metrics."""
+def value(result: dict[str, Any], key: str, fmt: str) -> str:
+    """Format one table cell with ``fmt`` (a str.format spec + unit)."""
     if result.get("unavailable"):
         return "unavailable"
     if key not in result:
         return "n/a"
-    item = result[key]
-    if isinstance(item, float):
-        item = f"{item:.3g}"
-    if per_run and not result["converged"]:
-        return f"not converged ({item}{unit})"
-    return f"{item}{unit}"
+    cell = fmt.format(result[key])
+    if key == "max_autocorr_time" and not result["autocorr_reliable"]:
+        cell += " (unreliable)"
+    return cell
 
 
-# (label, result key, unit, depends on the convergence run)
+# (label, result key, cell format)
 ROWS = (
-    ("Number of proposed steps to convergence", "steps_per_sampler", "", True),
+    ("Warmup steps per sampler", "warmup_steps", "{}"),
+    ("Sampling steps per sampler", "sampling_steps", "{}"),
     (
         "Time per posterior evaluation (serial)",
         "posterior_seconds",
-        " s",
-        False,
+        "{:.3g} s",
     ),
+    ("Batched posterior throughput", "posterior_per_second", "{:.3g} evals/s"),
+    ("Batched gradient throughput", "gradient_per_second", "{:.3g} evals/s"),
+    ("Total time", "total_seconds", "{:.4g} s"),
+    ("Sampling time", "sampling_seconds", "{:.4g} s"),
+    ("Mean leapfrog steps per draw", "mean_leapfrog_steps", "{:.3g}"),
+    ("Max leapfrog steps per draw", "max_leapfrog_steps", "{}"),
+    ("Divergent draws", "divergent_fraction", "{:.2%}"),
+    ("Max split R-hat", "max_rhat", "{:.4f}"),
     (
-        "Batched posterior throughput",
-        "posterior_per_second",
-        " evals/s",
-        False,
+        "Max integrated autocorrelation time",
+        "max_autocorr_time",
+        "{:.3g} steps",
     ),
-    ("Batched gradient throughput", "gradient_per_second", " evals/s", False),
-    ("Time to convergence", "time_to_convergence_seconds", " s", True),
+    ("Min ESS (bulk/tail)", "min_ess", "{:.0f}"),
+    ("Min ESS per second of sampling", "ess_per_second", "{:.3g}"),
 )
 
 
@@ -672,30 +727,39 @@ def format_table(results: list[dict[str, Any]], settings: Settings) -> str:
         "| Metric | " + " | ".join(labels) + " |",
         "|---|---|---|---|",
     ]
-    for label, key, unit, per_run in ROWS:
-        cells = [value(result, key, unit, per_run) for result in results]
+    for label, key, fmt in ROWS:
+        cells = [value(result, key, fmt) for result in results]
         lines.append(f"| {label} | " + " | ".join(cells) + " |")
     lines += [
         "",
-        "Convergence requires max rank-normalized split R-hat "
-        f"<= {settings.max_rhat} and min(bulk ESS, tail ESS) "
-        f">= {settings.min_ess}. "
-        f"Each column uses {settings.n_samplers} samplers; panco2 uses "
-        f"{settings.workers} CPU worker processes. panco3 NUTS warmup "
-        f"({settings.warmup} steps) is included in its step and "
-        "convergence-time totals.",
-        f"panco3 evaluates up to {settings.chain_batch_size} chains at once "
-        f"on CPU and {settings.gpu_chain_batch_size} on GPU.",
+        f"Each column runs {settings.n_samplers} samplers for "
+        f"{settings.warmup} warmup steps (emcee burn-in, discarded; NUTS "
+        f"window adaptation) and then {settings.steps} sampling steps. "
+        f"panco2 uses {settings.workers} CPU worker processes. panco3 CPU "
+        f"splits its chains evenly over {settings.workers} XLA CPU devices "
+        "(pmap over devices, vmap over each device's chains); panco3 GPU "
+        f"runs up to {settings.gpu_chain_batch_size} chains per call on one "
+        "GPU. A step costs one posterior evaluation per emcee walker but a "
+        "whole NUTS trajectory per chain: the leapfrog rows count the "
+        "gradient evaluations per NUTS draw.",
+        "",
+        "Total time runs from the start of warmup to the end of sampling and "
+        "includes worker start-up and all JAX compilation. Sampling time "
+        "covers the post-warmup steps only; the panco3 sampling kernel is "
+        "compiled before it starts.",
+        "",
+        "Convergence metrics use the sampling draws only, in natural "
+        "parameter space, and report the worst parameter: ArviZ "
+        "rank-normalized split R-hat and bulk/tail ESS, and emcee's "
+        "integrated autocorrelation time (marked unreliable when the chain "
+        "is shorter than 50 times the estimate).",
         "",
         "Serial timing evaluates one point per call. Batched throughput "
         f"evaluates {settings.throughput_batch} points per call: a vmap for "
         "panco3, and a map over the worker pool for panco2 (the way emcee "
         "evaluates walkers). The gradient row is the vmapped value and "
-        "gradient that NUTS uses; panco2 has no gradients.",
-        "",
-        "Posterior timing is steady-state and excludes JAX compilation; "
-        "time to convergence includes sampler initialization, adaptation, "
-        "and JAX compilation.",
+        "gradient that NUTS uses; panco2 has no gradients. Both exclude "
+        "JAX compilation.",
     ]
     return "\n".join(lines) + "\n"
 
@@ -730,7 +794,7 @@ def main() -> None:
         print(f"Running {case}...", flush=True)
         result_path = args.output.with_name(f".{case}.json")
         result = run_worker(
-            case, settings_path, result_path, args.gpu_platform
+            case, settings, settings_path, result_path, args.gpu_platform
         )
         results.append(result)
     if args.skip_gpu:
