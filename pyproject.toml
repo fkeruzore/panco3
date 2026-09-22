@@ -24,8 +24,17 @@ dependencies = [
 dev = [
     "ruff>=0.15.19",
     "pytest>=8.0",
-    "pytest-benchmark>=4.0",
 ]
+
+benchmark = [
+    {include-group = "dev"},
+    "panco2",
+    "py-cpuinfo>=9.0.0",
+    "pytest-benchmark>=5.3.0",
+]
+
+[tool.uv.sources]
+panco2 = { git = "https://github.com/fkeruzore/panco2" }
 
 [build-system]
 requires = ["hatchling"]
