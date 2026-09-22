@@ -58,12 +58,14 @@ class Settings:
     n_samplers: int
     workers: int
     chain_batch_size: int
+    gpu_chain_batch_size: int
     warmup: int
     check_every: int
     max_steps: int
     min_ess: int
     max_rhat: float
     posterior_repeats: int
+    throughput_batch: int
     seed: int
 
 
@@ -102,9 +104,16 @@ def parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help=(
-            "panco3 chains evaluated concurrently; defaults to --workers. "
-            "All chains still contribute to convergence diagnostics."
+            "panco3 CPU chains evaluated concurrently; defaults to "
+            "--workers. All chains still contribute to convergence "
+            "diagnostics."
         ),
+    )
+    p.add_argument(
+        "--gpu-chain-batch-size",
+        type=int,
+        default=None,
+        help="panco3 GPU chains evaluated concurrently; defaults to all.",
     )
     p.add_argument("--warmup", type=int, default=500)
     p.add_argument("--check-every", type=int, default=250)
@@ -112,6 +121,15 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--min-ess", type=int, default=400)
     p.add_argument("--max-rhat", type=float, default=1.01)
     p.add_argument("--posterior-repeats", type=int, default=20)
+    p.add_argument(
+        "--throughput-batch",
+        type=int,
+        default=None,
+        help=(
+            "Points per batched posterior/gradient call (panco3 vmap, "
+            "panco2 worker pool); defaults to --n-samplers."
+        ),
+    )
     p.add_argument("--seed", type=int, default=0)
     p.add_argument(
         "--gpu-platform",
@@ -136,8 +154,13 @@ def settings_from_args(args: argparse.Namespace) -> Settings:
     if args.check_every < 4:
         raise ValueError("--check-every must be at least 4.")
     chain_batch_size = args.chain_batch_size or args.workers
-    if chain_batch_size < 1:
-        raise ValueError("--chain-batch-size must be positive.")
+    gpu_chain_batch_size = args.gpu_chain_batch_size or args.n_samplers
+    throughput_batch = args.throughput_batch or args.n_samplers
+    if min(chain_batch_size, gpu_chain_batch_size, throughput_batch) < 1:
+        raise ValueError(
+            "--chain-batch-size, --gpu-chain-batch-size and "
+            "--throughput-batch must be positive."
+        )
     return Settings(
         map_file=str(args.map_file.resolve()),
         tf_file=str(args.tf_file.resolve()),
@@ -147,12 +170,14 @@ def settings_from_args(args: argparse.Namespace) -> Settings:
         n_samplers=args.n_samplers,
         workers=args.workers,
         chain_batch_size=chain_batch_size,
+        gpu_chain_batch_size=gpu_chain_batch_size,
         warmup=args.warmup,
         check_every=args.check_every,
         max_steps=args.max_steps,
         min_ess=args.min_ess,
         max_rhat=args.max_rhat,
         posterior_repeats=args.posterior_repeats,
+        throughput_batch=throughput_batch,
         seed=args.seed,
     )
 
@@ -212,6 +237,38 @@ def show_diagnostics(bar: tqdm, checked: dict[str, Any]) -> None:
         )
 
 
+def natural_starts(
+    pressure: np.ndarray, n: int, rng: np.random.Generator
+) -> np.ndarray:
+    """``n`` natural-space points well inside the common prior support."""
+    pressure = np.asarray(pressure)
+    center = np.concatenate((pressure, [-12.0, 0.0]))
+    scale = np.concatenate((0.10 * pressure, [0.09, 1e-6]))
+    starts = center + rng.normal(size=(n, center.size)) * scale
+    starts[:, : pressure.size] = np.clip(
+        starts[:, : pressure.size], 0.011 * pressure, 99.0 * pressure
+    )
+    return starts
+
+
+def natural_to_z(theta: np.ndarray, pressure: np.ndarray) -> np.ndarray:
+    """Map natural-space points exactly to panco3's unconstrained z space."""
+    n_bins = pressure.size
+    span = np.log(100.0 / 0.01)
+    frac = (np.log(theta[:, :n_bins]) - np.log(0.01 * pressure)) / span
+    z_press = np.log(frac / (1.0 - frac))
+    z_other = np.column_stack(
+        ((theta[:, n_bins] + 12.0) / 0.9, theta[:, n_bins + 1] / 1e-5)
+    )
+    return np.column_stack((z_press, z_other))
+
+
+def throughput_points(pressure: np.ndarray, settings: Settings) -> np.ndarray:
+    """Natural-space points for batched timing, independent of the starts."""
+    rng = np.random.default_rng(settings.seed + 1)
+    return natural_starts(pressure, settings.throughput_batch, rng)
+
+
 def measure_panco2_posterior(
     log_probability: Any, positions: np.ndarray, repeats: int
 ) -> float:
@@ -224,6 +281,26 @@ def measure_panco2_posterior(
             log_probability(position)
     elapsed = time.perf_counter() - start
     return elapsed / (repeats * len(positions))
+
+
+def measure_panco2_throughput(
+    log_probability: Any, positions: np.ndarray, settings: Settings
+) -> float:
+    """Posterior evaluations per second through a worker pool.
+
+    This is how emcee evaluates a batch of walkers, so it is panco2's
+    counterpart to a vmapped panco3 call.
+    """
+    from multiprocessing import Pool
+
+    with Pool(processes=settings.workers) as pool:
+        # The first map starts the workers and ships the model to them.
+        pool.map(log_probability, positions)
+        start = time.perf_counter()
+        for _ in range(settings.posterior_repeats):
+            pool.map(log_probability, positions)
+        elapsed = time.perf_counter() - start
+    return settings.posterior_repeats * len(positions) / elapsed
 
 
 def run_panco2(settings: Settings) -> dict[str, Any]:
@@ -257,24 +334,22 @@ def run_panco2(settings: Settings) -> dict[str, Any]:
         zero=ss.norm(0.0, 1e-5),
     )
 
+    from functools import partial
+
     from panco2.panco2 import log_post
 
-    def log_probability(theta: np.ndarray) -> float:
-        return log_post(theta, ppf._log_lhood, ppf.model.log_prior)[0]
+    # A partial (not a closure) so that the worker pool can pickle it.
+    log_probability = partial(
+        log_post, log_lhood=ppf._log_lhood, log_prior=ppf.model.log_prior
+    )
 
     rng = np.random.default_rng(settings.seed)
-    # Starts lie well inside the common prior support.  The same relative
-    # spread is converted to panco3's unconstrained coordinates below.
-    center = np.concatenate((np.asarray(pressure), [-12.0, 0.0]))
-    scale = np.concatenate((0.10 * np.asarray(pressure), [0.09, 1e-6]))
-    starts = (
-        center + rng.normal(size=(settings.n_samplers, center.size)) * scale
-    )
-    starts[:, : settings.n_bins] = np.clip(
-        starts[:, : settings.n_bins], 0.011 * pressure, 99.0 * pressure
-    )
+    starts = natural_starts(pressure, settings.n_samplers, rng)
     posterior_seconds = measure_panco2_posterior(
         log_probability, starts, settings.posterior_repeats
+    )
+    posterior_per_second = measure_panco2_throughput(
+        log_probability, throughput_points(pressure, settings), settings
     )
 
     # Import here to avoid creating worker processes while setup is timed.
@@ -290,7 +365,7 @@ def run_panco2(settings: Settings) -> dict[str, Any]:
     with Pool(processes=settings.workers) as pool:
         sampler = emcee.EnsembleSampler(
             settings.n_samplers,
-            center.size,
+            starts.shape[1],
             log_post,
             pool=pool,
             args=[ppf._log_lhood, ppf.model.log_prior],
@@ -317,6 +392,7 @@ def run_panco2(settings: Settings) -> dict[str, Any]:
         "converged": checked["converged"],
         "steps_per_sampler": int(draws.shape[1]),
         "posterior_seconds": posterior_seconds,
+        "posterior_per_second": posterior_per_second,
         "time_to_convergence_seconds": elapsed,
         "max_rhat": checked["max_rhat"],
         "min_ess": checked["min_ess"],
@@ -369,26 +445,11 @@ def run_panco3(settings: Settings, expected_device: str) -> dict[str, Any]:
 
     rng = np.random.default_rng(settings.seed)
     # Use shared natural-space starts, transformed exactly to panco3's z space.
-    natural = np.concatenate((pressure, [-12.0, 0.0]))
-    scale = np.concatenate((0.10 * pressure, [0.09, 1e-6]))
-    theta0 = (
-        natural + rng.normal(size=(settings.n_samplers, natural.size)) * scale
-    )
-    theta0[:, : settings.n_bins] = np.clip(
-        theta0[:, : settings.n_bins], 0.011 * pressure, 99.0 * pressure
-    )
-    span = np.log(100.0 / 0.01)
-    frac = (
-        np.log(theta0[:, : settings.n_bins]) - np.log(0.01 * pressure)
-    ) / span
-    z_press = np.log(frac / (1.0 - frac))
-    z_other = np.column_stack(
-        (
-            (theta0[:, settings.n_bins] + 12.0) / 0.9,
-            theta0[:, settings.n_bins + 1] / 1e-5,
+    z0 = jnp.asarray(
+        natural_to_z(
+            natural_starts(pressure, settings.n_samplers, rng), pressure
         )
     )
-    z0 = jnp.asarray(np.column_stack((z_press, z_other)))
 
     single_log_posterior = jax.jit(log_posterior)
     single_log_posterior(z0[0]).block_until_ready()
@@ -402,6 +463,30 @@ def run_panco3(settings: Settings, expected_device: str) -> dict[str, Any]:
         settings.posterior_repeats * settings.n_samplers
     )
 
+    # Batched throughput is the GPU-relevant figure: one vmapped call over
+    # many points amortizes kernel launches that dominate a scalar call.
+    z_batch = jnp.asarray(
+        natural_to_z(throughput_points(pressure, settings), pressure)
+    )
+
+    def per_second(batched: Any) -> float:
+        jax.block_until_ready(batched(z_batch))
+        start = time.perf_counter()
+        for _ in range(settings.posterior_repeats):
+            jax.block_until_ready(batched(z_batch))
+        elapsed = time.perf_counter() - start
+        return settings.posterior_repeats * settings.throughput_batch / elapsed
+
+    posterior_per_second = per_second(jax.jit(jax.vmap(log_posterior)))
+    gradient_per_second = per_second(
+        jax.jit(jax.vmap(jax.value_and_grad(log_posterior)))
+    )
+
+    batch_size = (
+        settings.gpu_chain_batch_size
+        if expected_device == "gpu"
+        else settings.chain_batch_size
+    )
     warmup_key, sample_key = jax.random.split(
         jax.random.PRNGKey(settings.seed)
     )
@@ -432,9 +517,9 @@ def run_panco3(settings: Settings, expected_device: str) -> dict[str, Any]:
     state_batches = []
     parameter_batches = []
     z_batches = []
-    firsts = range(0, settings.n_samplers, settings.chain_batch_size)
+    firsts = range(0, settings.n_samplers, batch_size)
     for first in tqdm(firsts, desc="panco3 warmup", unit="batch"):
-        last = min(first + settings.chain_batch_size, settings.n_samplers)
+        last = min(first + batch_size, settings.n_samplers)
         states, parameters = run_warmup(chain_keys[first:last], z0[first:last])
         jax.block_until_ready(states)
         state_batches.append(states)
@@ -486,11 +571,13 @@ def run_panco3(settings: Settings, expected_device: str) -> dict[str, Any]:
         "converged": checked["converged"],
         "steps_per_sampler": settings.warmup + int(samples.shape[1]),
         "posterior_seconds": posterior_seconds,
+        "posterior_per_second": posterior_per_second,
+        "gradient_per_second": gradient_per_second,
         "time_to_convergence_seconds": elapsed,
         "max_rhat": checked["max_rhat"],
         "min_ess": checked["min_ess"],
         "n_samplers": settings.n_samplers,
-        "chain_batch_size": settings.chain_batch_size,
+        "chain_batch_size": batch_size,
     }
 
 
@@ -543,38 +630,52 @@ def run_worker(
     return json.loads(result_path.read_text())
 
 
-def value(result: dict[str, Any], key: str, unit: str = "") -> str:
+def value(
+    result: dict[str, Any], key: str, unit: str = "", per_run: bool = False
+) -> str:
+    """Format one table cell; ``per_run`` marks convergence-run metrics."""
     if result.get("unavailable"):
         return "unavailable"
+    if key not in result:
+        return "n/a"
     item = result[key]
     if isinstance(item, float):
         item = f"{item:.3g}"
-    if not result["converged"]:
+    if per_run and not result["converged"]:
         return f"not converged ({item}{unit})"
     return f"{item}{unit}"
 
 
+# (label, result key, unit, depends on the convergence run)
+ROWS = (
+    ("Number of proposed steps to convergence", "steps_per_sampler", "", True),
+    (
+        "Time per posterior evaluation (serial)",
+        "posterior_seconds",
+        " s",
+        False,
+    ),
+    (
+        "Batched posterior throughput",
+        "posterior_per_second",
+        " evals/s",
+        False,
+    ),
+    ("Batched gradient throughput", "gradient_per_second", " evals/s", False),
+    ("Time to convergence", "time_to_convergence_seconds", " s", True),
+)
+
+
 def format_table(results: list[dict[str, Any]], settings: Settings) -> str:
     labels = ["panco2 (CPU-only)", "panco3 (CPU-only)", "panco3 (GPU)"]
-    cells = []
-    for result in results:
-        cells.append(
-            (
-                value(result, "steps_per_sampler"),
-                value(result, "posterior_seconds", " s"),
-                value(result, "time_to_convergence_seconds", " s"),
-            )
-        )
     lines = [
         "| Metric | " + " | ".join(labels) + " |",
         "|---|---|---|---|",
-        "| Number of proposed steps to convergence | "
-        + " | ".join(x[0] for x in cells)
-        + " |",
-        "| Time per posterior evaluation | "
-        + " | ".join(x[1] for x in cells)
-        + " |",
-        "| Time to convergence | " + " | ".join(x[2] for x in cells) + " |",
+    ]
+    for label, key, unit, per_run in ROWS:
+        cells = [value(result, key, unit, per_run) for result in results]
+        lines.append(f"| {label} | " + " | ".join(cells) + " |")
+    lines += [
         "",
         "Convergence requires max rank-normalized split R-hat "
         f"<= {settings.max_rhat} and min(bulk ESS, tail ESS) "
@@ -583,7 +684,14 @@ def format_table(results: list[dict[str, Any]], settings: Settings) -> str:
         f"{settings.workers} CPU worker processes. panco3 NUTS warmup "
         f"({settings.warmup} steps) is included in its step and "
         "convergence-time totals.",
-        f"panco3 evaluates up to {settings.chain_batch_size} chains at once.",
+        f"panco3 evaluates up to {settings.chain_batch_size} chains at once "
+        f"on CPU and {settings.gpu_chain_batch_size} on GPU.",
+        "",
+        "Serial timing evaluates one point per call. Batched throughput "
+        f"evaluates {settings.throughput_batch} points per call: a vmap for "
+        "panco3, and a map over the worker pool for panco2 (the way emcee "
+        "evaluates walkers). The gradient row is the vmapped value and "
+        "gradient that NUTS uses; panco2 has no gradients.",
         "",
         "Posterior timing is steady-state and excludes JAX compilation; "
         "time to convergence includes sampler initialization, adaptation, "
